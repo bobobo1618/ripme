@@ -34,12 +34,16 @@ public class GDriveStorage extends AbstractStorage {
     private static Drive drive;
     private Map<String, String> pathCache;
     private Semaphore pathCheckSemaphore;
+    private Semaphore presenceSemaphore;
     private String drivePrefix;
+    private HashMap<String, HashSet<String>> presenceCache;
 
     public GDriveStorage() throws AuthenticationException {
         super();
         pathCache = new HashMap<String, String>();
         pathCheckSemaphore = new Semaphore(1);
+        presenceSemaphore = new Semaphore(1);
+        presenceCache = new HashMap<String, HashSet<String>>();
     }
 
     @Override
@@ -116,7 +120,7 @@ public class GDriveStorage extends AbstractStorage {
             fullPath = path[0];
         } else {
             fullPath = path[0];
-            for (Integer i = 0; i < path.length; i++) {
+            for (Integer i = 0; i < path.length - 1; i++) {
                 fullPath += java.io.File.separator + path[i];
             }
         }
@@ -191,6 +195,29 @@ public class GDriveStorage extends AbstractStorage {
         insert.execute();
     }
 
+    private void populatePresenceCache(ParentReference parent) throws IOException {
+        if (presenceCache.containsKey(parent.getId())) {
+            return;
+        }
+        logger.info("Populating presence cache for " + parent.getId());
+        HashSet<String> newCache = new HashSet<String>();
+        Drive.Files.List listReq = drive.files().list();
+        String query = "'" + parent.getId() + "' in parents and trashed=false";
+        listReq.setQ(query);
+        listReq.setMaxResults(1000);
+
+        do {
+            FileList listRes = listReq.execute();
+            listReq.setPageToken(listRes.getNextPageToken());
+            for (File file : listRes.getItems()) {
+                newCache.add(file.getTitle());
+            }
+        } while (listReq.getPageToken() != null && listReq.getPageToken().length() > 0);
+
+        presenceCache.put(parent.getId(), newCache);
+        logger.info("Presence cache for " + parent.getId() + " generated");
+    }
+
     @Override
     public boolean fileExists(String path) {
         try {
@@ -199,16 +226,22 @@ public class GDriveStorage extends AbstractStorage {
             if (parent == null) {
                 return false;
             }
-            Drive.Files.List listReq = drive.files().list();
-            String fileName = splitPath[splitPath.length - 1];
-            String query = "title = '" + fileName.replace("'", "\\'") + "' and '"
-                    + parent.getId() + "' in parents and trashed=false";
-            listReq.setQ(query);
-            List<File> listRes = listReq.execute().getItems();
-            return listRes.size() > 0;
+
+            if(presenceCache.containsKey(parent.getId())) {
+                return presenceCache.get(parent.getId()).contains(splitPath[splitPath.length-1]);
+            } else {
+                presenceSemaphore.acquireUninterruptibly();
+                try {
+                    populatePresenceCache(parent);
+                } catch (IOException e) {
+                    presenceSemaphore.release();
+                    throw e;
+                }
+                presenceSemaphore.release();
+                return presenceCache.get(parent.getId()).contains(splitPath[splitPath.length-1]);
+            }
         } catch (IOException e) {
             return false;
         }
-
     }
 }
